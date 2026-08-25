@@ -11121,6 +11121,208 @@ exit:
 }
 
 #define MAX_NUM_OF_ASSOCIATED_DEV       64
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0))
+static s32 wl_cfg80211_mgmt_tx(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,
+	struct cfg80211_mgmt_tx_params *params, u64 cookie)
+{
+	wl_action_frame_v1_t *action_frame;
+	wl_af_params_v1_t *af_params;
+	scb_val_t scb_val;
+	struct ieee80211_channel *channel = params->chan;
+	const u8 *buf = params->buf;
+	size_t len = params->len;
+	const struct ieee80211_mgmt *mgmt;
+	struct bcm_cfg80211 *cfg = wiphy_priv(wiphy);
+	struct net_device *dev = NULL;
+	s32 err = BCME_OK;
+	s32 bssidx = 0;
+	u32 id;
+	bool ack = false;
+	s8 eabuf[ETHER_ADDR_STR_LEN];
+
+	WL_DBG(("Enter \n"));
+
+	if (len > ACTION_FRAME_SIZE) {
+		WL_ERR(("bad length:%zu\n", len));
+		return BCME_BADLEN;
+	}
+
+#ifdef DHD_IFDEBUG
+	PRINT_WDEV_INFO(cfgdev);
+#endif /* DHD_IFDEBUG */
+
+	dev = cfgdev_to_wlc_ndev(cfgdev, cfg);
+
+	if (!dev) {
+		WL_ERR(("dev is NULL\n"));
+		return -EINVAL;
+	}
+
+	/* set bsscfg idx for iovar (wlan0: P2PAPI_BSSCFG_PRIMARY, p2p: P2PAPI_BSSCFG_DEVICE)	*/
+	if (discover_cfgdev(cfgdev, cfg)) {
+		if (!cfg->p2p_supported || !cfg->p2p) {
+			WL_ERR(("P2P doesn't setup completed yet\n"));
+			return -EINVAL;
+		}
+		bssidx = wl_to_p2p_bss_bssidx(cfg, P2PAPI_BSSCFG_DEVICE);
+	}
+	else {
+		if ((bssidx = wl_get_bssidx_by_wdev(cfg, cfgdev_to_wdev(cfgdev))) < 0) {
+			WL_ERR(("Failed to find bssidx\n"));
+			return BCME_ERROR;
+		}
+	}
+
+	WL_DBG(("TX target bssidx=%d\n", bssidx));
+
+	if (p2p_is_on(cfg)) {
+		/* Suspend P2P discovery search-listen to prevent it from changing the
+		 * channel.
+		 */
+		if ((err = wl_cfgp2p_discover_enable_search(cfg, false)) < 0) {
+			WL_ERR(("Can not disable discovery mode\n"));
+			return -EFAULT;
+		}
+	}
+	// cookie = 0;
+	id = cfg->send_action_id++;
+	if (id == 0)
+		id = cfg->send_action_id++;
+	// cookie = id;
+	mgmt = (const struct ieee80211_mgmt *)buf;
+	if (ieee80211_is_mgmt(mgmt->frame_control)) {
+		if (ieee80211_is_probe_resp(mgmt->frame_control)) {
+			s32 ie_offset =  DOT11_MGMT_HDR_LEN + DOT11_BCN_PRB_FIXED_LEN;
+			s32 ie_len = len - ie_offset;
+			if ((dev == bcmcfg_to_prmry_ndev(cfg)) && cfg->p2p) {
+				bssidx = wl_to_p2p_bss_bssidx(cfg, P2PAPI_BSSCFG_DEVICE);
+			}
+			wl_cfg80211_set_mgmt_vndr_ies(cfg, cfgdev, bssidx,
+				VNDR_IE_PRBRSP_FLAG, (const u8 *)(buf + ie_offset), ie_len);
+			cfg80211_mgmt_tx_status(cfgdev, cookie, buf, len, true, GFP_KERNEL);
+#if defined(P2P_IE_MISSING_FIX)
+			if (!cfg->p2p_prb_noti) {
+				cfg->p2p_prb_noti = true;
+				WL_DBG(("wl_cfg80211_mgmt_tx: TX 802_1X Probe"
+					" Response first time.\n"));
+			}
+#endif
+			goto exit;
+		} else if (ieee80211_is_disassoc(mgmt->frame_control) ||
+			ieee80211_is_deauth(mgmt->frame_control)) {
+			char mac_buf[MAX_NUM_OF_ASSOCIATED_DEV *
+				sizeof(struct ether_addr) + sizeof(uint)] = {0};
+			int num_associated = 0;
+			struct maclist *assoc_maclist = (struct maclist *)mac_buf;
+			if (!bcmp((const uint8 *)BSSID_BROADCAST,
+				(const struct ether_addr *)mgmt->da, ETHER_ADDR_LEN)) {
+				assoc_maclist->count = MAX_NUM_OF_ASSOCIATED_DEV;
+				err = wldev_ioctl_get(dev, WLC_GET_ASSOCLIST,
+					assoc_maclist, sizeof(mac_buf));
+				if (err < 0)
+					WL_ERR(("WLC_GET_ASSOCLIST error %d\n", err));
+				else
+					num_associated = assoc_maclist->count;
+			}
+			memcpy(scb_val.ea.octet, mgmt->da, ETH_ALEN);
+			scb_val.val = mgmt->u.disassoc.reason_code;
+			err = wldev_ioctl_set(dev, WLC_SCB_DEAUTHENTICATE_FOR_REASON, &scb_val,
+				sizeof(scb_val_t));
+			if (err < 0)
+				WL_ERR(("WLC_SCB_DEAUTHENTICATE_FOR_REASON error %d\n", err));
+			WL_ERR(("Disconnect STA : " MACDBG " scb_val.val %d\n",
+				MAC2STRDBG(bcm_ether_ntoa((const struct ether_addr *)mgmt->da,
+				eabuf)), scb_val.val));
+
+			/* WAR Wait for the deauth event to come,
+			 * supplicant will do the delete iface immediately
+			 * and we will have problem in sending
+			 * deauth frame if we delete the bss in firmware.
+			 * But we do not need additional delays for this WAR
+			 * during P2P connection.
+			 *
+			 * Supplicant call this function with BCAST after
+			 * delete all GC stations with each addr.
+			 * So, 400 ms delay can be called only once when GO disconnect all GC
+			*/
+			if (num_associated > 0 && ETHER_ISBCAST(mgmt->da))
+				wl_delay(400);
+
+			cfg80211_mgmt_tx_status(cfgdev, cookie, buf, len, true, GFP_KERNEL);
+			goto exit;
+
+		} else if (ieee80211_is_action(mgmt->frame_control)) {
+			/* Abort the dwell time of any previous off-channel
+			* action frame that may be still in effect.  Sending
+			* off-channel action frames relies on the driver's
+			* scan engine.  If a previous off-channel action frame
+			* tx is still in progress (including the dwell time),
+			* then this new action frame will not be sent out.
+			*/
+/* Do not abort scan for VSDB. Scan will be aborted in firmware if necessary.
+ * And previous off-channel action frame must be ended before new af tx.
+ */
+#ifndef WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST
+			wl_cfgscan_cancel_scan(cfg);
+#endif /* not WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST */
+		}
+#ifdef WL_CLIENT_SAE
+		else if (ieee80211_is_auth(mgmt->frame_control)) {
+			err = wl_cfg80211_mgmt_auth_tx(dev, cfgdev, cfg, buf, len,
+				bssidx, &cookie);
+			goto exit;
+		}
+#endif /* WL_CLIENT_SAE */
+	} else {
+		WL_ERR(("Driver only allows MGMT packet type\n"));
+		goto exit;
+	}
+
+	af_params = (wl_af_params_v1_t *)MALLOCZ(cfg->osh, WL_WIFI_AF_PARAMS_SIZE_V1);
+	if (af_params == NULL)
+	{
+		WL_ERR(("unable to allocate frame\n"));
+		return -ENOMEM;
+	}
+
+	action_frame = &af_params->action_frame;
+
+	/* Add the packet Id */
+	action_frame->packetId = cookie;
+	WL_DBG(("action frame %d\n", action_frame->packetId));
+	/* Add BSSID */
+	memcpy(&action_frame->da, &mgmt->da[0], ETHER_ADDR_LEN);
+	memcpy(&af_params->BSSID, &mgmt->bssid[0], ETHER_ADDR_LEN);
+	/* Add the length exepted for 802.11 header  */
+	action_frame->len = len - DOT11_MGMT_HDR_LEN;
+	WL_DBG(("action_frame->len: %d\n", action_frame->len));
+
+	if (channel) {
+		/* Add the channel */
+		af_params->channel =
+			wl_freq_to_chanspec(channel->center_freq);
+	} else {
+		af_params->channel = 0;
+	}
+
+	/* Save listen_chan for searching common channel */
+	cfg->afx_hdl->peer_listen_chan = af_params->channel;
+	WL_DBG(("channel from upper layer %d\n", cfg->afx_hdl->peer_listen_chan));
+
+	af_params->dwell_time = params->wait;
+
+	memcpy(action_frame->data, &buf[DOT11_MGMT_HDR_LEN], action_frame->len);
+
+	ack = wl_cfg80211_send_action_frame(wiphy, dev, cfgdev, af_params,
+		action_frame, action_frame->len, bssidx, mgmt->sa);
+	cfg80211_mgmt_tx_status(cfgdev, cookie, buf, len, ack, GFP_KERNEL);
+	WL_DBG(("txstatus notified for cookie:%llu. ack:%d\n", cookie, ack));
+
+	MFREE(cfg->osh, af_params, WL_WIFI_AF_PARAMS_SIZE_V1);
+exit:
+	return err;
+}
+#else
 static s32
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
 wl_cfg80211_mgmt_tx(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,
@@ -11345,6 +11547,7 @@ wl_cfg80211_mgmt_tx(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,
 exit:
 	return err;
 }
+#endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)) */
 
 static void
 wl_cfg80211_mgmt_frame_register(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,

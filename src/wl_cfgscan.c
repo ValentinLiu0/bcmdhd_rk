@@ -5652,6 +5652,151 @@ wl_priortize_scan_over_listen(struct bcm_cfg80211 *cfg,
 	(wdev->netdev ? (strncmp(wdev->netdev->name, "p2p0", strlen("p2p0")) == 0) : false)
 
 s32
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0))
+wl_cfgscan_remain_on_channel(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,
+	struct ieee80211_channel *channel, unsigned int duration, u64 cookie, const u8 *rx_addr)
+{
+	s32 target_channel;
+	u32 id;
+	s32 err = BCME_OK;
+	struct net_device *ndev = NULL;
+	struct bcm_cfg80211 *cfg = wiphy_priv(wiphy);
+	struct wireless_dev *wdev;
+
+	RETURN_EIO_IF_NOT_UP(cfg);
+
+	ndev = cfgdev_to_wlc_ndev(cfgdev, cfg);
+	wdev = cfgdev;
+	if (!wdev) {
+		WL_ERR(("wdev null\n"));
+		err = -EINVAL;
+		goto exit;
+	}
+
+	if (wl_get_drv_status(cfg, AP_CREATING, ndev)) {
+		err = BCME_BADARG;
+		goto exit;
+	}
+
+	target_channel = ieee80211_frequency_to_channel(channel->center_freq);
+
+	WL_DBG(("Enter, channel: %d, duration ms (%d) scan_state:%d\n",
+		target_channel, duration,
+		(wl_get_drv_status(cfg, SCANNING, ndev)) ? TRUE : FALSE));
+
+#ifdef WL_BCNRECV
+	/* check fakeapscan in progress then abort */
+	wl_android_bcnrecv_stop(ndev, WL_BCNRECV_LISTENBUSY);
+#endif /* WL_BCNRECV */
+
+	if ((wdev->iftype == NL80211_IFTYPE_P2P_DEVICE) || IS_P2P_DISC_NDEV(wdev))
+	{
+		/* p2p discovery */
+		if (!cfg->p2p) {
+			WL_ERR(("cfg->p2p is not initialized\n"));
+			err = BCME_ERROR;
+			goto exit;
+		}
+
+#ifdef P2P_LISTEN_OFFLOADING
+		if (wl_get_p2p_status(cfg, DISC_IN_PROGRESS)) {
+			WL_ERR(("P2P_FIND: Discovery offload is in progress\n"));
+			err = -EAGAIN;
+			goto exit;
+		}
+#endif /* P2P_LISTEN_OFFLOADING */
+
+		if (wl_get_drv_status_all(cfg, SCANNING)) {
+#ifdef WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST
+			if (duration > LONG_LISTEN_TIME) {
+				wl_cfgscan_cancel_scan(cfg);
+			} else {
+				wl_priortize_scan_over_listen(cfg, ndev, duration);
+				err = BCME_OK;
+				goto exit;
+			}
+#else
+			wl_cfgscan_cancel_scan(cfg);
+#endif /* WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST */
+		}
+
+#ifdef WL_CFG80211_SYNC_GON
+		if (wl_get_drv_status_all(cfg, WAITING_NEXT_ACT_FRM_LISTEN)) {
+			/* Do not enter listen mode again if we are in listen mode already
+			* for next af. Remain on channel completion will be returned by
+			* af completion.
+			*/
+#ifdef WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST
+			wl_set_drv_status(cfg, FAKE_REMAINING_ON_CHANNEL, ndev);
+#else
+			wl_set_drv_status(cfg, REMAINING_ON_CHANNEL, ndev);
+#endif
+			goto exit;
+		}
+#endif /* WL_CFG80211_SYNC_GON */
+
+		if (!cfg->p2p->on) {
+		/* In case of p2p_listen command, supplicant may send
+		* remain_on_channel without turning on P2P
+		*/
+			p2p_on(cfg) = true;
+		}
+
+		err = wl_cfgp2p_enable_discovery(cfg, ndev, NULL, 0);
+		if (unlikely(err)) {
+			goto exit;
+		}
+
+		mutex_lock(&cfg->usr_sync);
+		err = wl_cfgp2p_discover_listen(cfg, target_channel, duration);
+		if (err == BCME_OK) {
+			wl_set_drv_status(cfg, REMAINING_ON_CHANNEL, ndev);
+		} else {
+#ifdef WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST
+			if (err == BCME_BUSY) {
+				/* if failed, firmware may be internal scanning state.
+				* so other scan request shall not abort it
+				*/
+				wl_set_drv_status(cfg, FAKE_REMAINING_ON_CHANNEL, ndev);
+				/* WAR: set err = ok to prevent cookie mismatch in wpa_supplicant
+				* and expire timer will send a completion to the upper layer
+				*/
+				err = BCME_OK;
+			}
+#endif /* WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST */
+		}
+		mutex_unlock(&cfg->usr_sync);
+	} else if (wdev->iftype == NL80211_IFTYPE_STATION ||
+		wdev->iftype == NL80211_IFTYPE_AP) {
+		WL_DBG(("LISTEN ON CHANNEL\n"));
+		err = wl_cfgscan_listen_on_channel(cfg, wdev, channel, duration);
+	}
+
+exit:
+	if (err == BCME_OK) {
+		WL_DBG(("Success\n"));
+		(void)memcpy_s(&cfg->remain_on_chan, sizeof(struct ieee80211_channel),
+			channel, sizeof(struct ieee80211_channel));
+#if defined(WL_ENABLE_P2P_IF)
+		cfg->remain_on_chan_type = channel_type;
+#endif /* WL_ENABLE_P2P_IF */
+		id = ++cfg->last_roc_id;
+		if (id == 0) {
+			id = ++cfg->last_roc_id;
+		}
+		// cookie = id;
+
+		/* Notify userspace that listen has started */
+		CFG80211_READY_ON_CHANNEL(cfgdev, cookie, channel, channel_type, duration, flags);
+		WL_INFORM_MEM(("listen started on channel:%d duration (ms):%d cookie:%llu\n",
+				target_channel, duration, cookie));
+	} else {
+		WL_ERR(("Fail to Set (err=%d cookie:%llu)\n", err, cookie));
+		wl_flush_fw_log_buffer(ndev, FW_LOGSET_MASK_ALL);
+	}
+	return err;
+}
+#else
 #if defined(WL_CFG80211_P2P_DEV_IF)
 wl_cfgscan_remain_on_channel(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev,
 	struct ieee80211_channel *channel, unsigned int duration, u64 *cookie)
@@ -5810,6 +5955,7 @@ exit:
 	}
 	return err;
 }
+#endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)) */
 
 s32
 wl_cfgscan_cancel_remain_on_channel(struct wiphy *wiphy,
