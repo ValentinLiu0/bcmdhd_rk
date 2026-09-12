@@ -20,6 +20,8 @@
 # <<Broadcom-WL-IPTag/Open:>>
 #
 
+UBSAN_SANITIZE := n
+
 MODULE_NAME := bcmdhd
 CONFIG_AP6XXX ?= m
 
@@ -72,33 +74,35 @@ ARCH = arm64
 CONFIG_BCMDHD_FW_PATH="/lib/firmware/ap6275p/fw_bcmdhd.bin"
 CONFIG_BCMDHD_NVRAM_PATH="/lib/firmware/ap6275p/nvram.txt"
 
-DHDCFLAGS = -Wall -Wstrict-prototypes -Wno-date-time -Wno-strict-prototypes   \
-	-Wno-uninitialized -Wno-unused-but-set-variable -Wno-address	      \
-	-Wno-missing-prototypes						      \
-	-Dlinux -DLINUX -DBCMDRIVER -DBCMUTILS_ERR_CODES                      \
-	-DBCMDONGLEHOST -DBCMDMA32 -DBCMFILEIMAGE                             \
-	-DDHDTHREAD -DDHD_DEBUG -DSHOW_EVENTS -DGET_OTP_MAC_ENABLE            \
-	-DWIFI_ACT_FRAME -DARP_OFFLOAD_SUPPORT -DSUPPORT_PM2_ONLY             \
-	-DPKTPRIO_OVERRIDE                                                    \
-	-DKEEP_ALIVE -DPKT_FILTER_SUPPORT -DDHDTCPACK_SUPPRESS                \
-	-DDHD_DONOT_FORWARD_BCMEVENT_AS_NETWORK_PKT -DOEM_ANDROID             \
-	-DMULTIPLE_SUPPLICANT -DTSQ_MULTIPLIER -DMFP -DDHD_8021X_DUMP         \
-	-DPOWERUP_MAX_RETRY=0 -DIFACE_HANG_FORCE_DEV_CLOSE -DWAIT_DEQUEUE     \
-	-DUSE_NEW_RSPEC_DEFS                                                  \
-	-DWL_EXT_IAPSTA -DWL_ESCAN -DCCODE_LIST -DSUSPEND_EVENT               \
-	-DKEY_INSTALL_CHECK                                                   \
+DHDCFLAGS = -Wall -Wstrict-prototypes -Wno-date-time -Wno-strict-prototypes	\
+	-Wno-uninitialized -Wno-unused-but-set-variable -Wno-address		\
+	-Wno-missing-prototypes							\
+	-Wno-unused-variable -Wno-missing-declarations -Wno-empty-body		\
+	-Wno-attribute-warning							\
+	-Dlinux -DLINUX -DBCMDRIVER -DBCMUTILS_ERR_CODES			\
+	-DBCMDONGLEHOST -DBCMDMA32 -DBCMFILEIMAGE				\
+	-DDHDTHREAD -DDHD_DEBUG -DSHOW_EVENTS -DGET_OTP_MAC_ENABLE		\
+	-DWIFI_ACT_FRAME -DARP_OFFLOAD_SUPPORT -DSUPPORT_PM2_ONLY		\
+	-DPKTPRIO_OVERRIDE							\
+	-DKEEP_ALIVE -DPKT_FILTER_SUPPORT -DDHDTCPACK_SUPPRESS			\
+	-DDHD_DONOT_FORWARD_BCMEVENT_AS_NETWORK_PKT -DOEM_ANDROID		\
+	-DMULTIPLE_SUPPLICANT -DTSQ_MULTIPLIER -DMFP -DDHD_8021X_DUMP		\
+	-DPOWERUP_MAX_RETRY=0 -DIFACE_HANG_FORCE_DEV_CLOSE -DWAIT_DEQUEUE	\
+	-DUSE_NEW_RSPEC_DEFS							\
+	-DWL_EXT_IAPSTA -DWL_ESCAN -DCCODE_LIST -DSUSPEND_EVENT			\
+	-DKEY_INSTALL_CHECK							\
 	-DENABLE_INSMOD_NO_FW_LOAD
 
-DHDOFILES = aiutils.o siutils.o sbutils.o                                 \
-	bcmutils.o bcmwifi_channels.o bcmxtlv.o bcm_app_utils.o bcmstdlib_s.o \
-	dhd_linux.o dhd_linux_platdev.o dhd_linux_sched.o dhd_pno.o           \
-	dhd_common.o dhd_ip.o dhd_linux_wq.o dhd_custom_gpio.o                \
-	bcmevent.o hndpmu.o linux_osl.o wldev_common.o wl_android.o           \
-	dhd_debug_linux.o dhd_debug.o dhd_mschdbg.o dhd_dbg_ring.o            \
-	hnd_pktq.o hnd_pktpool.o linux_pkt.o frag.o                           \
-	dhd_linux_exportfs.o dhd_linux_pktdump.o dhd_mschdbg.o linuxerrmap.o  \
-	dhd_linux_tx.o dhd_linux_rx.o fwpkg_utils.o                           \
-	dhd_config.o dhd_ccode.o wl_event.o wl_android_ext.o                  \
+DHDOFILES = aiutils.o siutils.o sbutils.o					\
+	bcmutils.o bcmwifi_channels.o bcmxtlv.o bcm_app_utils.o bcmstdlib_s.o	\
+	dhd_linux.o dhd_linux_platdev.o dhd_linux_sched.o dhd_pno.o		\
+	dhd_common.o dhd_ip.o dhd_linux_wq.o dhd_custom_gpio.o			\
+	bcmevent.o hndpmu.o linux_osl.o wldev_common.o wl_android.o		\
+	dhd_debug_linux.o dhd_debug.o dhd_mschdbg.o dhd_dbg_ring.o		\
+	hnd_pktq.o hnd_pktpool.o linux_pkt.o frag.o				\
+	dhd_linux_exportfs.o dhd_linux_pktdump.o dhd_mschdbg.o linuxerrmap.o	\
+	dhd_linux_tx.o dhd_linux_rx.o fwpkg_utils.o				\
+	dhd_config.o dhd_ccode.o wl_event.o wl_android_ext.o			\
 	wl_iapsta.o wl_escan.o wl_timer.o
 
 ifneq ($(CONFIG_WIRELESS_EXT),)
